@@ -1,0 +1,156 @@
+use std::path::PathBuf;
+use std::sync::Mutex;
+use std::sync::mpsc::Sender;
+
+use crate::{audio, local, openrouter};
+
+pub enum Event {
+    Status(String),
+    Progress { id: String, msg: String },
+    Finished { id: String, result: Result<String, String> },
+    Merged(Result<String, String>),
+    Done,
+}
+
+pub struct Job {
+    pub file: PathBuf,
+    pub key: String,
+    pub language: String,
+    /// (id, label). Local ids are prefixed with `local/`.
+    pub models: Vec<(String, String)>,
+    pub merge: bool,
+    pub llm: String,
+    pub prompt: String,
+}
+
+/// OpenRouter accepts these as-is when we cannot decode the file ourselves.
+const PASSTHROUGH: &[&str] = &["wav", "mp3", "flac", "m4a", "ogg", "webm", "aac", "opus"];
+const PASSTHROUGH_LIMIT: u64 = 25 * 1024 * 1024;
+
+pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
+    let send = |e: Event| {
+        let _ = tx.send(e);
+        ctx.request_repaint();
+    };
+
+    send(Event::Status("Reading audio…".into()));
+    let decoded = audio::decode(&job.file);
+    let has_remote = job.models.iter().any(|(id, _)| !id.starts_with("local/"));
+
+    // Remote payload: decoded WAV chunks, or the original file if we could not decode it.
+    let remote_parts: Result<Vec<(Vec<u8>, String)>, String> = if !has_remote {
+        Ok(Vec::new())
+    } else {
+        match &decoded {
+            Ok(samples) => audio::wav_chunks(samples)
+                .map(|c| c.into_iter().map(|b| (b, "wav".to_string())).collect())
+                .map_err(|e| e.to_string()),
+            Err(e) => passthrough(&job.file).ok_or_else(|| format!("Cannot read this audio file: {e}")),
+        }
+    };
+    if let Ok(parts) = &remote_parts {
+        if parts.len() > 1 {
+            send(Event::Status(format!("Long recording: split into {} parts", parts.len())));
+        }
+    }
+    send(Event::Status("Transcribing…".into()));
+
+    let results: Mutex<Vec<(usize, String, String)>> = Mutex::new(Vec::new());
+    std::thread::scope(|s| {
+        for (i, (id, label)) in job.models.iter().enumerate() {
+            let (send, results, job, decoded, remote_parts) = (&send, &results, &job, &decoded, &remote_parts);
+            s.spawn(move || {
+                let progress = |msg: String| send(Event::Progress { id: id.clone(), msg });
+                let result = if let Some(name) = id.strip_prefix("local/") {
+                    match decoded {
+                        Ok(samples) => local::transcribe(name, samples, &job.language, &progress).map_err(|e| e.to_string()),
+                        Err(e) => Err(format!("This file type can't be read on this computer ({e}). Try an online model.")),
+                    }
+                } else {
+                    remote_parts.as_ref().map_err(Clone::clone).and_then(|parts| {
+                        let mut texts = Vec::new();
+                        for (n, (bytes, fmt)) in parts.iter().enumerate() {
+                            if parts.len() > 1 {
+                                progress(format!("Part {} of {}…", n + 1, parts.len()));
+                            }
+                            texts.push(
+                                openrouter::transcribe(&job.key, id, bytes, fmt, &job.language).map_err(|e| e.to_string())?,
+                            );
+                        }
+                        Ok(texts.join("\n"))
+                    })
+                };
+                if let Ok(text) = &result {
+                    results.lock().unwrap().push((i, label.clone(), text.clone()));
+                }
+                send(Event::Finished { id: id.clone(), result });
+            });
+        }
+    });
+
+    let mut results = results.into_inner().unwrap();
+    results.sort_by_key(|r| r.0);
+    if job.merge && !results.is_empty() {
+        send(Event::Status("Combining the transcripts…".into()));
+        let body = results
+            .iter()
+            .enumerate()
+            .map(|(n, (_, label, text))| format!("### Transcript {} ({label})\n{text}", n + 1))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let merged = openrouter::chat(&job.key, &job.llm, &job.prompt, &body).map_err(|e| e.to_string());
+        send(Event::Merged(merged));
+    }
+    send(Event::Done);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// End-to-end against the real API. Run with:
+    /// OPENROUTER_API_KEY=… TEST_AUDIO=/path/file cargo test --release -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn end_to_end() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let job = Job {
+            file: std::env::var("TEST_AUDIO").expect("TEST_AUDIO").into(),
+            key: std::env::var("OPENROUTER_API_KEY").expect("OPENROUTER_API_KEY"),
+            language: String::new(),
+            models: vec![
+                ("openai/gpt-4o-mini-transcribe".into(), "gpt-4o-mini".into()),
+                ("qwen/qwen3-asr-0.6b".into(), "qwen".into()),
+                ("local/tiny".into(), "local tiny".into()),
+            ],
+            merge: true,
+            llm: crate::config::DEFAULT_LLM.into(),
+            prompt: crate::config::DEFAULT_PROMPT.into(),
+        };
+        run(job, tx, eframe::egui::Context::default());
+        let mut failures = 0;
+        for ev in rx {
+            match ev {
+                Event::Finished { id, result } => {
+                    println!("{id}: {result:?}");
+                    failures += result.is_err() as u32;
+                }
+                Event::Merged(r) => {
+                    println!("MERGED: {r:?}");
+                    failures += r.is_err() as u32;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(failures, 0);
+    }
+}
+
+fn passthrough(file: &PathBuf) -> Option<Vec<(Vec<u8>, String)>> {
+    let ext = file.extension()?.to_str()?.to_lowercase();
+    let fmt = if ext == "opus" { "ogg".to_string() } else { ext };
+    if !PASSTHROUGH.contains(&fmt.as_str()) || std::fs::metadata(file).ok()?.len() > PASSTHROUGH_LIMIT {
+        return None;
+    }
+    Some(vec![(std::fs::read(file).ok()?, fmt)])
+}

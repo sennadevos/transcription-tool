@@ -1,0 +1,14 @@
+# Build environment. DEBIAN=bookworm for Linux (glibc 2.36, runs on older distros);
+# DEBIAN=trixie for Windows (whisper.cpp needs mingw-w64 >= 11 headers).
+ARG DEBIAN=bookworm
+FROM docker.io/library/rust:1.99.0-${DEBIAN}
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake clang libclang-dev mingw-w64 \
+        libgtk-3-dev libxkbcommon-dev libwayland-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    # whisper.cpp needs std::mutex/std::thread, which only mingw's posix thread model provides
+    && update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix \
+    && update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix \
+    # whisper-rs-sys links stdc++ as a dylib; without the import lib, ld falls back to libstdc++.a
+    && rm -f /usr/lib/gcc/x86_64-w64-mingw32/*-posix/libstdc++.dll.a \
+    && rustup target add x86_64-pc-windows-gnu
