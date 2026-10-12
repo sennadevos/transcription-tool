@@ -2,7 +2,7 @@
 
 - **Form:** native Rust desktop app (egui), one executable, Windows + Linux. Non-technical users.
 - **Install:** first launch offers "Install": copies itself to the user's app dir, adds a Start Menu/app-menu shortcut and a desktop shortcut. No admin rights.
-- **Auth:** user-entered OpenRouter API key, saved locally. Nothing embedded.
+- **Auth:** user-entered OpenRouter API key, saved locally. Nothing embedded. Entered once per key lifetime: asked again only when the key is refused (e.g. expired; keys handed to team members last 180 days).
 - **Input:** one audio file (file picker or drag-and-drop).
 - **Models:**
   - Remote: all OpenRouter STT models, fetched live (`/models?output_modalities=transcription`), via `/audio/transcriptions`.

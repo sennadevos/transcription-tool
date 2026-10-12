@@ -6,7 +6,7 @@ See [SPEC.md](SPEC.md).
 
 1. Download `transcription-tool.exe` (Windows) or `transcription-tool` (Linux) and open it. On Windows, if SmartScreen warns about an unknown app: **More info → Run anyway**.
 2. Click **Install**. The app then appears in the Start menu / app menu and on the desktop.
-3. Open **⚙ Settings** and paste the API key you received.
+3. Paste the API key you received when asked. It is saved; you only need to enter a new one when it expires (a key lasts 180 days), via the prompt in the error message or Settings.
 4. Choose an audio file (or drag it onto the window), pick models, click **Transcribe**.
 
 Settings → **Uninstall…** removes the app, its shortcuts, settings and downloaded models.

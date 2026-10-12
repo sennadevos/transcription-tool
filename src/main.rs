@@ -421,7 +421,7 @@ impl App {
         ui.add_space(70.0);
         ui.label(RichText::new("Transcription Tool").family(theme::semibold()).size(26.0));
         ui.add_space(6.0);
-        ui.label(muted(ui, "Paste the key you received to get started. You only need to do this once."));
+        ui.label(muted(ui, "Paste the key you received to get started. You only need to do this again when the key expires."));
         ui.add_space(22.0);
         self.ui_key_form(ui, "Continue", false);
         if let Some(e) = &self.key_error {
