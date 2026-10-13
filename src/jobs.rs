@@ -27,6 +27,10 @@ pub struct Job {
 const PASSTHROUGH: &[&str] = &["wav", "mp3", "flac", "m4a", "ogg", "webm", "aac", "opus"];
 const PASSTHROUGH_LIMIT: u64 = 25 * 1024 * 1024;
 
+const CANT_READ: &str = "This file can't be opened as audio. Try an mp3, wav or m4a file.";
+const CANT_PREPARE: &str = "This recording could not be prepared for sending. Try another file.";
+const NO_TEXT: &str = "This model found no speech. The recording may be silent, or the model may not support this language.";
+
 pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
     let send = |e: Event| {
         let _ = tx.send(e);
@@ -44,8 +48,8 @@ pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
         match &decoded {
             Ok(samples) => audio::wav_chunks(samples)
                 .map(|c| c.into_iter().map(|b| (b, "wav".to_string())).collect())
-                .map_err(|e| e.to_string()),
-            Err(e) => passthrough(&job.file).ok_or_else(|| format!("Cannot read this audio file: {e}")),
+                .map_err(|_| CANT_PREPARE.to_string()),
+            Err(_) => passthrough(&job.file).ok_or_else(|| CANT_READ.to_string()),
         }
     };
     if let Ok(parts) = &remote_parts {
@@ -64,7 +68,7 @@ pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
                 let result = if let Some(name) = id.strip_prefix("local/") {
                     match decoded {
                         Ok(samples) => local::transcribe(name, samples, &job.language, &progress).map_err(|e| e.to_string()),
-                        Err(e) => Err(format!("This file type can't be read on this computer ({e}). Try an online model.")),
+                        Err(_) => Err("This file type can't be transcribed on this computer. Try an online model.".to_string()),
                     }
                 } else {
                     remote_parts.as_ref().map_err(Clone::clone).and_then(|parts| {
@@ -80,6 +84,7 @@ pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
                         Ok(texts.join("\n"))
                     })
                 };
+                let result = result.and_then(|t| if t.trim().is_empty() { Err(NO_TEXT.to_string()) } else { Ok(t) });
                 if let Ok(text) = &result {
                     results.lock().unwrap().push((i, label.clone(), text.clone()));
                 }

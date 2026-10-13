@@ -92,6 +92,9 @@ struct App {
     key_checking: bool,
     key_error: Option<String>,
     key_rx: Option<Receiver<(String, Result<(), String>)>>,
+    /// Set when the saved key was found to be refused or out of credit, before the user tries anything.
+    key_notice: Option<String>,
+    key_notice_rx: Option<Receiver<Result<(), String>>>,
 }
 
 // ---------- small widgets ----------
@@ -247,12 +250,30 @@ impl App {
             key_checking: false,
             key_error: None,
             key_rx: None,
+            key_notice: None,
+            key_notice_rx: None,
         };
         if let Some(p) = std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
             app.set_file(p);
         }
         app.load_catalog(ctx);
+        app.recheck_saved_key(ctx);
         app
+    }
+
+    /// Asks OpenRouter (free of charge) whether the saved key still works, so an expired key shows up before the first transcription.
+    fn recheck_saved_key(&mut self, ctx: &egui::Context) {
+        if !self.has_key() {
+            return;
+        }
+        let key = self.settings.api_key.clone();
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(openrouter::check_key(&key).map_err(|e| e.to_string()));
+            ctx.request_repaint();
+        });
+        self.key_notice_rx = Some(rx);
     }
 
     fn set_file(&mut self, path: PathBuf) {
@@ -309,6 +330,13 @@ impl App {
                 self.catalog_rx = None;
             }
         }
+        if let Some(rx) = &self.key_notice_rx {
+            if let Ok(res) = rx.try_recv() {
+                self.key_notice_rx = None;
+                // Being offline says nothing about the key, so only a real refusal is shown.
+                self.key_notice = res.err().filter(|e| openrouter::is_key_problem(e));
+            }
+        }
         if let Some(rx) = &self.key_rx {
             if let Ok((key, res)) = rx.try_recv() {
                 self.key_rx = None;
@@ -316,6 +344,7 @@ impl App {
                 match res {
                     Ok(()) => {
                         self.settings.api_key = key;
+                        self.key_notice = None;
                         self.dirty = true;
                         self.key_input.clear();
                         self.key_editing = false;
@@ -474,6 +503,13 @@ impl App {
             ui.label(RichText::new(msg).color(p.error));
             ui.add_space(8.0);
         }
+        if let Some(msg) = &self.key_notice {
+            ui.label(RichText::new(msg).color(p.error));
+            if link(ui, "Update your key") {
+                self.open_key_settings();
+            }
+            ui.add_space(8.0);
+        }
 
         self.ui_file(ui);
         ui.add_space(16.0);
@@ -606,7 +642,7 @@ impl App {
                     }
                 }
                 (None, Some(e)) => {
-                    ui.label(RichText::new(format!("Could not load the model list: {e}")).color(p.error));
+                    ui.label(RichText::new(format!("The model list could not be loaded. {e}")).color(p.error));
                     if link(ui, "Try again") {
                         self.load_catalog(ui.ctx());
                     }
@@ -814,7 +850,14 @@ impl App {
         ui.add_space(4.0);
         egui::ScrollArea::vertical().max_height(320.0).auto_shrink([false, true]).show(ui, |ui| {
             let Some(cat) = &self.catalog else {
-                ui.label(muted(ui, "Loading models…"));
+                if let Some(e) = &self.catalog_error {
+                    ui.label(RichText::new(format!("The model list could not be loaded. {e}")).color(theme::palette(ui.ctx()).error));
+                    if link(ui, "Try again") {
+                        self.load_catalog(ui.ctx());
+                    }
+                } else {
+                    ui.label(muted(ui, "Loading models…"));
+                }
                 return;
             };
             let q = self.llm_filter.to_lowercase();

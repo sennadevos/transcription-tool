@@ -30,11 +30,11 @@ fn download(name: &str, progress: &dyn Fn(String)) -> Result<PathBuf> {
     if path.is_file() {
         return Ok(path);
     }
-    std::fs::create_dir_all(models_dir())?;
+    std::fs::create_dir_all(models_dir()).map_err(|_| anyhow!("The model could not be saved. Is the disk full?"))?;
     let url = format!("https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-{name}.bin");
-    let mut resp = crate::openrouter::agent().get(&url).call()?;
+    let mut resp = crate::openrouter::agent().get(&url).call().map_err(crate::openrouter::net_error)?;
     if !resp.status().is_success() {
-        return Err(anyhow!("Model download failed: HTTP {}", resp.status()));
+        return Err(anyhow!("The model could not be downloaded (error {}). Try again later.", resp.status().as_u16()));
     }
     let total = resp.body().content_length().unwrap_or(0);
     let tmp = path.with_extension("part");
@@ -43,11 +43,11 @@ fn download(name: &str, progress: &dyn Fn(String)) -> Result<PathBuf> {
     let mut buf = vec![0u8; 1 << 20];
     let (mut done, mut last_pct) = (0u64, u64::MAX);
     loop {
-        let n = reader.read(&mut buf)?;
+        let n = reader.read(&mut buf).map_err(|_| anyhow!("The download was interrupted. Check your internet connection and try again."))?;
         if n == 0 {
             break;
         }
-        out.write_all(&buf[..n])?;
+        out.write_all(&buf[..n]).map_err(|_| anyhow!("The model could not be saved. Is the disk full?"))?;
         done += n as u64;
         let pct = if total > 0 { done * 100 / total } else { 0 };
         if pct != last_pct {
@@ -64,9 +64,12 @@ fn download(name: &str, progress: &dyn Fn(String)) -> Result<PathBuf> {
 pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn(String)) -> Result<String> {
     let path = download(name, progress)?;
     progress("Loading model…".into());
-    let ctx = WhisperContext::new_with_params(path.to_str().context("bad model path")?, WhisperContextParameters::default())
-        .map_err(|e| anyhow!("Cannot load model: {e}"))?;
-    let mut state = ctx.create_state().map_err(|e| anyhow!("{e}"))?;
+    let ctx = WhisperContext::new_with_params(path.to_str().context("bad model path")?, WhisperContextParameters::default()).map_err(|_| {
+        // A damaged file would fail every time; remove it so the next run downloads a fresh copy.
+        let _ = std::fs::remove_file(&path);
+        anyhow!("This model file was damaged and has been removed. Try again to download it fresh.")
+    })?;
+    let mut state = ctx.create_state().map_err(|_| anyhow!("There is not enough memory to run this model. Try a smaller one."))?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some(if language.is_empty() { "auto" } else { language }));
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
@@ -76,7 +79,7 @@ pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
     progress("Transcribing on this computer…".into());
-    state.full(params, samples).map_err(|e| anyhow!("{e}"))?;
+    state.full(params, samples).map_err(|_| anyhow!("Transcribing on this computer failed. Try a smaller model."))?;
     let text: Vec<String> = state.as_iter().map(|s| s.to_string().trim().to_owned()).collect();
     Ok(text.join(" "))
 }
