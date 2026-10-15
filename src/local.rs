@@ -71,7 +71,7 @@ pub struct Outcome {
 }
 
 /// `eta` is called about twice a second with the estimated seconds left, once whisper has finished its first stretch of audio.
-pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn(String), eta: &(dyn Fn(f64) + Sync)) -> Result<Outcome> {
+pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn(String), eta: &(dyn Fn(f64) + Sync), cancel: &Arc<AtomicBool>) -> Result<Outcome> {
     let path = download(name, progress)?;
     progress("Loading model…".into());
     let ctx = WhisperContext::new_with_params(path.to_str().context("bad model path")?, WhisperContextParameters::default()).map_err(|_| {
@@ -82,8 +82,11 @@ pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn
     let mut state = ctx.create_state().map_err(|_| anyhow!("There is not enough memory to run this model. Try a smaller one."))?;
     let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
     params.set_language(Some(if language.is_empty() { "auto" } else { language }));
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    params.set_n_threads(threads as i32);
+    // Leave a quarter of the processor free so the computer stays usable while this runs.
+    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    params.set_n_threads((cores * 3 / 4).max(1) as i32);
+    let stop = cancel.clone();
+    params.set_abort_callback_safe(move || stop.load(Ordering::Relaxed));
     params.set_print_special(false);
     params.set_print_progress(false);
     params.set_print_realtime(false);
@@ -91,7 +94,7 @@ pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn
     let percent = Arc::new(AtomicI32::new(0));
     let seen = percent.clone();
     params.set_progress_callback_safe(move |p: i32| seen.store(p, Ordering::Relaxed));
-    progress("Transcribing on this computer…".into());
+    progress("Transcribing on this computer… the time left shows once the first 30 seconds are done".into());
     let started = Instant::now();
     let finished = AtomicBool::new(false);
     let result = std::thread::scope(|scope| {
@@ -108,6 +111,9 @@ pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn
         finished.store(true, Ordering::Relaxed);
         r
     });
+    if cancel.load(Ordering::Relaxed) {
+        return Err(anyhow!("Stopped."));
+    }
     result.map_err(|_| anyhow!("Transcribing on this computer failed. Try a smaller model."))?;
     let speed = samples.len() as f64 / crate::audio::RATE as f64 / started.elapsed().as_secs_f64().max(0.001);
     let text: Vec<String> = state.as_iter().map(|s| s.to_string().trim().to_owned()).collect();
@@ -122,7 +128,7 @@ mod tests {
     fn local_progress() {
         let samples = crate::audio::decode(std::path::Path::new(&std::env::var("TEST_AUDIO").expect("TEST_AUDIO"))).unwrap();
         let etas = std::sync::Mutex::new(Vec::new());
-        let out = super::transcribe("tiny", &samples, "", &|m| println!("{m}"), &|r| etas.lock().unwrap().push(r)).unwrap();
+        let out = super::transcribe("tiny", &samples, "", &|m| println!("{m}"), &|r| etas.lock().unwrap().push(r), &Default::default()).unwrap();
         let etas = etas.into_inner().unwrap();
         println!("audio {:.0}s, speed {:.1}x, {} estimates, first {:?}, last {:?}", samples.len() as f64 / 16000.0, out.speed, etas.len(), etas.first(), etas.last());
         assert!(out.speed > 0.0 && !out.text.is_empty());

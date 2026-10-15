@@ -66,6 +66,7 @@ struct Card {
     id: String,
     label: String,
     state: CardState,
+    started: std::time::Instant,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -98,6 +99,8 @@ struct App {
     key_error: Option<String>,
     key_rx: Option<Receiver<(String, Result<(), String>)>>,
     /// Set when the saved key was found to be refused or out of credit, before the user tries anything.
+    /// Stops local transcription of the running job.
+    cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     key_notice: Option<String>,
     key_notice_rx: Option<Receiver<Result<(), String>>>,
 }
@@ -307,6 +310,7 @@ impl App {
             key_checking: false,
             key_error: None,
             key_rx: None,
+            cancel: None,
             key_notice: None,
             key_notice_rx: None,
         };
@@ -446,6 +450,7 @@ impl App {
         }
         if done {
             self.rx = None;
+            self.cancel = None;
             self.status.clear();
         }
     }
@@ -501,7 +506,7 @@ impl App {
     fn start(&mut self, ctx: &egui::Context) {
         let Some(file) = self.file.clone() else { return };
         let models: Vec<(String, String)> = self.selected_ids().into_iter().map(|id| (self.model_name(&id), id)).map(|(n, i)| (i, n)).collect();
-        self.cards = models.iter().map(|(id, label)| Card { id: id.clone(), label: label.clone(), state: CardState::Running("Waiting…".into()) }).collect();
+        self.cards = models.iter().map(|(id, label)| Card { id: id.clone(), label: label.clone(), state: CardState::Running("Waiting…".into()), started: std::time::Instant::now() }).collect();
         self.merged = self.settings.merge.then(|| CardState::Running("Waiting for the transcripts…".into()));
         let job = Job {
             file,
@@ -511,7 +516,9 @@ impl App {
             merge: self.settings.merge,
             llm: self.settings.llm.clone(),
             prompt: self.settings.prompt.clone(),
+            cancel: Default::default(),
         };
+        self.cancel = Some(job.cancel.clone());
         let (tx, rx) = channel();
         self.rx = Some(rx);
         let ctx = ctx.clone();
@@ -768,15 +775,17 @@ impl App {
         let mut fix_key = false;
         let file = self.file.clone();
         if let Some(state) = &self.merged {
-            fix_key |= Self::ui_result(ui, "Final transcript", None, state, file.as_ref());
+            fix_key |= Self::ui_result(ui, "Final transcript", None, state, file.as_ref(), None, &mut false);
             ui.add_space(14.0);
         }
         if self.cards.is_empty() {
             return;
         }
-        let draw = |ui: &mut egui::Ui, fix_key: &mut bool| {
+        let mut stop = false;
+        let draw = |ui: &mut egui::Ui, fix_key: &mut bool, stop: &mut bool| {
             for c in &self.cards {
-                *fix_key |= Self::ui_result(ui, &c.label, None, &c.state, file.as_ref());
+                let live = (c.id.starts_with("local/") && self.cancel.is_some()).then(|| c.started.elapsed().as_secs());
+                *fix_key |= Self::ui_result(ui, &c.label, None, &c.state, file.as_ref(), live, stop);
                 ui.add_space(10.0);
             }
         };
@@ -785,9 +794,14 @@ impl App {
             egui::CollapsingHeader::new(semibold(format!("Individual results ({})", self.cards.len())))
                 .id_salt("individual")
                 .default_open(failed)
-                .show(ui, |ui| draw(ui, &mut fix_key));
+                .show(ui, |ui| draw(ui, &mut fix_key, &mut stop));
         } else {
-            draw(ui, &mut fix_key);
+            draw(ui, &mut fix_key, &mut stop);
+        }
+        if stop {
+            if let Some(flag) = &self.cancel {
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
         if fix_key {
             self.open_key_settings();
@@ -795,7 +809,8 @@ impl App {
     }
 
     /// Returns true if the user asked to fix their key.
-    fn ui_result(ui: &mut egui::Ui, title: &str, subtitle: Option<&str>, state: &CardState, file: Option<&PathBuf>) -> bool {
+    /// `live` is the seconds a local run has been going; it adds a clock and a Stop link to the running card.
+    fn ui_result(ui: &mut egui::Ui, title: &str, subtitle: Option<&str>, state: &CardState, file: Option<&PathBuf>, live: Option<u64>, stop: &mut bool) -> bool {
         let p = theme::palette(ui.ctx());
         let mut fix = false;
         ui.horizontal(|ui| {
@@ -823,7 +838,16 @@ impl App {
                 ui.horizontal(|ui| {
                     ui.spinner();
                     ui.label(muted(ui, status));
+                    if let Some(secs) = live {
+                        ui.label(muted(ui, format!("{}:{:02}", secs / 60, secs % 60)));
+                        if link(ui, "Stop") {
+                            *stop = true;
+                        }
+                    }
                 });
+                if live.is_some() {
+                    ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
+                }
                 if !warning.is_empty() {
                     ui.label(warning);
                 }

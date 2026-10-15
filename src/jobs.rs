@@ -1,5 +1,6 @@
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 use std::sync::mpsc::Sender;
 
 use crate::{audio, local, openrouter};
@@ -23,6 +24,8 @@ pub struct Job {
     pub merge: bool,
     pub llm: String,
     pub prompt: String,
+    /// Set to stop local transcription; online requests finish by themselves.
+    pub cancel: Arc<AtomicBool>,
 }
 
 /// OpenRouter accepts these as-is when we cannot decode the file ourselves.
@@ -91,7 +94,7 @@ pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
                                 }
                                 progress(msg);
                             };
-                            local::transcribe(name, samples, &job.language, &progress, &eta)
+                            local::transcribe(name, samples, &job.language, &progress, &eta, &job.cancel)
                                 .map(|o| {
                                     // Short clips are dominated by fixed costs, so they say little about speed.
                                     if samples.len() >= 60 * audio::RATE as usize {
@@ -172,6 +175,7 @@ mod tests {
             merge: true,
             llm: crate::config::DEFAULT_LLM.into(),
             prompt: crate::config::DEFAULT_PROMPT.into(),
+            cancel: Default::default(),
         };
         run(job, tx, eframe::egui::Context::default());
         let mut failures = 0;
