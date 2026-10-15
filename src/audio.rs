@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow};
 use symphonia::core::codecs::audio::AudioDecoderOptions;
 use symphonia::core::codecs::registry::CodecRegistry;
 use symphonia::core::errors::Error;
-use symphonia::core::formats::FormatOptions;
+use symphonia::core::formats::{FormatOptions, FormatReader};
 use symphonia::core::formats::TrackType;
 use symphonia::core::formats::probe::Hint;
 use symphonia::core::io::MediaSourceStream;
@@ -24,17 +24,29 @@ static CODECS: LazyLock<CodecRegistry> = LazyLock::new(|| {
     r
 });
 
-/// Decode any supported audio file to 16 kHz mono f32.
-pub fn decode(path: &Path) -> Result<Vec<f32>> {
+fn probe(path: &Path) -> Result<Box<dyn FormatReader>> {
     let file = File::open(path).context("cannot open file")?;
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
         hint.with_extension(ext);
     }
-    let mut format = symphonia::default::get_probe()
+    symphonia::default::get_probe()
         .probe(&hint, mss, FormatOptions::default(), MetadataOptions::default())
-        .context("unsupported audio format")?;
+        .context("unsupported audio format")
+}
+
+/// Length in seconds as declared by the file, without decoding it. None when the format does not say.
+pub fn duration_secs(path: &Path) -> Option<f64> {
+    let format = probe(path).ok()?;
+    let track = format.default_track(TrackType::Audio)?;
+    let (frames, base) = (track.num_frames?, track.time_base?);
+    Some(frames as f64 * base.numer.get() as f64 / base.denom.get() as f64)
+}
+
+/// Decode any supported audio file to 16 kHz mono f32.
+pub fn decode(path: &Path) -> Result<Vec<f32>> {
+    let mut format = probe(path)?;
     let track = format.default_track(TrackType::Audio).ok_or_else(|| anyhow!("no audio track"))?;
     let track_id = track.id;
     let params = track
@@ -115,4 +127,15 @@ pub fn wav_chunks(samples: &[f32]) -> Result<Vec<Vec<u8>>> {
             Ok(out.into_inner())
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    /// Run with TEST_AUDIO=/path/file cargo test --release -- --ignored --nocapture duration_probe
+    #[test]
+    #[ignore]
+    fn duration_probe() {
+        let path = std::path::PathBuf::from(std::env::var("TEST_AUDIO").expect("TEST_AUDIO"));
+        println!("{:?}", super::duration_secs(&path));
+    }
 }

@@ -41,6 +41,8 @@ const LANGUAGES: &[(&str, &str)] = &[
     ("ja", "Japanese"),
 ];
 const COLUMN_WIDTH: f32 = 680.0;
+/// A local model expected to take longer than this on the chosen file triggers a warning before starting.
+const SLOW_LOCAL_SECS: f64 = 180.0;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -81,6 +83,8 @@ struct App {
     catalog_rx: Option<Receiver<Result<Catalog, String>>>,
     file: Option<PathBuf>,
     file_size: u64,
+    /// Length of the chosen file in seconds, when the file says so.
+    file_secs: Option<f64>,
     filter: String,
     llm_filter: String,
     cards: Vec<Card>,
@@ -290,6 +294,7 @@ impl App {
             catalog_rx: None,
             file: None,
             file_size: 0,
+            file_secs: None,
             filter: String::new(),
             llm_filter: String::new(),
             cards: Vec::new(),
@@ -330,6 +335,7 @@ impl App {
 
     fn set_file(&mut self, path: PathBuf) {
         self.file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.file_secs = audio::duration_secs(&path);
         self.file = Some(path);
     }
 
@@ -415,6 +421,12 @@ impl App {
                         c.state = CardState::Running(msg);
                     }
                 }
+                Event::LocalSpeed { model, speed } => {
+                    // Blend with earlier runs so one run on a busy machine does not decide everything.
+                    let blended = self.settings.local_speed.get(&model).map_or(speed, |old| (old + speed) / 2.0);
+                    self.settings.local_speed.insert(model, blended);
+                    self.dirty = true;
+                }
                 Event::Finished { id, result } => {
                     if let Some(c) = self.cards.iter_mut().find(|c| c.id == id) {
                         c.state = match result {
@@ -459,6 +471,22 @@ impl App {
             .collect();
         ids.extend(local::MODELS.iter().filter(|m| self.settings.local_models.contains(m.0)).map(|m| format!("local/{}", m.0)));
         ids
+    }
+
+    /// Warns before starting when a local model is known to be slow on this computer for this file.
+    fn slow_local_note(&self) -> Option<String> {
+        let secs = self.file_secs?;
+        let local: Vec<&String> = self.settings.local_models.iter().collect();
+        // Several local models share the same processor, so each takes about that many times longer.
+        let share = local.len() as f64;
+        let (name, est) = local
+            .iter()
+            .filter_map(|m| Some((m, secs / *self.settings.local_speed.get(*m)? * share)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))?;
+        (est > SLOW_LOCAL_SECS).then(|| {
+            let title = local::MODELS.iter().find(|m| m.0 == name.as_str()).map_or(name.as_str(), |m| m.1);
+            format!("{title} will take {} on this computer. Online models are usually much quicker.", jobs::human_duration(est))
+        })
     }
 
     fn model_summary(&self) -> String {
@@ -654,6 +682,10 @@ impl App {
                 });
             });
         });
+        if let Some(note) = self.slow_local_note() {
+            ui.add_space(6.0);
+            ui.label(note);
+        }
         ui.add_space(6.0);
         self.dirty |= ui.checkbox(&mut self.settings.merge, "Combine into one final transcript").changed();
     }
@@ -787,10 +819,14 @@ impl App {
         });
         match state {
             CardState::Running(msg) => {
+                let (status, warning) = msg.split_once('\n').unwrap_or((msg, ""));
                 ui.horizontal(|ui| {
                     ui.spinner();
-                    ui.label(muted(ui, msg.clone()));
+                    ui.label(muted(ui, status));
                 });
+                if !warning.is_empty() {
+                    ui.label(warning);
+                }
             }
             CardState::Ok(text) => {
                 surface_panel(ui).show(ui, |ui| {

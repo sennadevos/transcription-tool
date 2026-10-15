@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -22,6 +22,8 @@ pub struct Settings {
     pub install_dismissed: bool,
     /// "system", "light" or "dark".
     pub theme: String,
+    /// Measured on this computer: seconds of audio each local model handles per second of work.
+    pub local_speed: BTreeMap<String, f64>,
 }
 
 impl Default for Settings {
@@ -36,6 +38,7 @@ impl Default for Settings {
             language: String::new(),
             install_dismissed: false,
             theme: "system".into(),
+            local_speed: BTreeMap::new(),
         }
     }
 }

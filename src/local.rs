@@ -1,5 +1,8 @@
 use std::io::{Read, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
@@ -61,7 +64,14 @@ fn download(name: &str, progress: &dyn Fn(String)) -> Result<PathBuf> {
     Ok(path)
 }
 
-pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn(String)) -> Result<String> {
+pub struct Outcome {
+    pub text: String,
+    /// Seconds of audio handled per second of work on this computer.
+    pub speed: f64,
+}
+
+/// `eta` is called about twice a second with the estimated seconds left, once whisper has finished its first stretch of audio.
+pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn(String), eta: &(dyn Fn(f64) + Sync)) -> Result<Outcome> {
     let path = download(name, progress)?;
     progress("Loading model…".into());
     let ctx = WhisperContext::new_with_params(path.to_str().context("bad model path")?, WhisperContextParameters::default()).map_err(|_| {
@@ -78,8 +88,43 @@ pub fn transcribe(name: &str, samples: &[f32], language: &str, progress: &dyn Fn
     params.set_print_progress(false);
     params.set_print_realtime(false);
     params.set_print_timestamps(false);
+    let percent = Arc::new(AtomicI32::new(0));
+    let seen = percent.clone();
+    params.set_progress_callback_safe(move |p: i32| seen.store(p, Ordering::Relaxed));
     progress("Transcribing on this computer…".into());
-    state.full(params, samples).map_err(|_| anyhow!("Transcribing on this computer failed. Try a smaller model."))?;
+    let started = Instant::now();
+    let finished = AtomicBool::new(false);
+    let result = std::thread::scope(|scope| {
+        scope.spawn(|| {
+            while !finished.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                let p = percent.load(Ordering::Relaxed);
+                if p > 0 && p < 100 {
+                    eta(started.elapsed().as_secs_f64() * (100.0 - p as f64) / p as f64);
+                }
+            }
+        });
+        let r = state.full(params, samples);
+        finished.store(true, Ordering::Relaxed);
+        r
+    });
+    result.map_err(|_| anyhow!("Transcribing on this computer failed. Try a smaller model."))?;
+    let speed = samples.len() as f64 / crate::audio::RATE as f64 / started.elapsed().as_secs_f64().max(0.001);
     let text: Vec<String> = state.as_iter().map(|s| s.to_string().trim().to_owned()).collect();
-    Ok(text.join(" "))
+    Ok(Outcome { text: text.join(" "), speed })
+}
+
+#[cfg(test)]
+mod tests {
+    /// Needs internet for the first model download. Run with TEST_AUDIO=/path/file cargo test --release -- --ignored --nocapture local_progress
+    #[test]
+    #[ignore]
+    fn local_progress() {
+        let samples = crate::audio::decode(std::path::Path::new(&std::env::var("TEST_AUDIO").expect("TEST_AUDIO"))).unwrap();
+        let etas = std::sync::Mutex::new(Vec::new());
+        let out = super::transcribe("tiny", &samples, "", &|m| println!("{m}"), &|r| etas.lock().unwrap().push(r)).unwrap();
+        let etas = etas.into_inner().unwrap();
+        println!("audio {:.0}s, speed {:.1}x, {} estimates, first {:?}, last {:?}", samples.len() as f64 / 16000.0, out.speed, etas.len(), etas.first(), etas.last());
+        assert!(out.speed > 0.0 && !out.text.is_empty());
+    }
 }

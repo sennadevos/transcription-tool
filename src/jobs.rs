@@ -7,6 +7,8 @@ use crate::{audio, local, openrouter};
 pub enum Event {
     Status(String),
     Progress { id: String, msg: String },
+    /// How fast a local model ran on this computer, for estimating the next run.
+    LocalSpeed { model: String, speed: f64 },
     Finished { id: String, result: Result<String, String> },
     Merged(Result<String, String>),
     Done,
@@ -26,6 +28,20 @@ pub struct Job {
 /// OpenRouter accepts these as-is when we cannot decode the file ourselves.
 const PASSTHROUGH: &[&str] = &["wav", "mp3", "flac", "m4a", "ogg", "webm", "aac", "opus"];
 const PASSTHROUGH_LIMIT: u64 = 25 * 1024 * 1024;
+
+/// A local run expected to take longer than this gets a warning while it runs.
+const SLOW_SECS: f64 = 300.0;
+
+/// "less than a minute", "about 4 min", "about 1 h 20 min".
+pub fn human_duration(secs: f64) -> String {
+    let mins = (secs / 60.0).ceil() as u64;
+    match mins {
+        0 | 1 if secs < 45.0 => "less than a minute".into(),
+        0 | 1 => "about 1 min".into(),
+        2..=89 => format!("about {mins} min"),
+        _ => format!("about {} h {} min", mins / 60, mins % 60),
+    }
+}
 
 const CANT_READ: &str = "This file can't be opened as audio. Try an mp3, wav or m4a file.";
 const CANT_PREPARE: &str = "This recording could not be prepared for sending. Try another file.";
@@ -67,7 +83,24 @@ pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
                 let progress = |msg: String| send(Event::Progress { id: id.clone(), msg });
                 let result = if let Some(name) = id.strip_prefix("local/") {
                     match decoded {
-                        Ok(samples) => local::transcribe(name, samples, &job.language, &progress).map_err(|e| e.to_string()),
+                        Ok(samples) => {
+                            let eta = |remaining: f64| {
+                                let mut msg = format!("Transcribing on this computer… {} left", human_duration(remaining));
+                                if remaining > SLOW_SECS {
+                                    msg.push_str("\nThis is slow on this computer. Online models are usually much quicker.");
+                                }
+                                progress(msg);
+                            };
+                            local::transcribe(name, samples, &job.language, &progress, &eta)
+                                .map(|o| {
+                                    // Short clips are dominated by fixed costs, so they say little about speed.
+                                    if samples.len() >= 60 * audio::RATE as usize {
+                                        send(Event::LocalSpeed { model: name.to_string(), speed: o.speed });
+                                    }
+                                    o.text
+                                })
+                                .map_err(|e| e.to_string())
+                        }
                         Err(_) => Err("This file type can't be transcribed on this computer. Try an online model.".to_string()),
                     }
                 } else {
@@ -112,6 +145,14 @@ pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durations_read_naturally() {
+        assert_eq!(human_duration(10.0), "less than a minute");
+        assert_eq!(human_duration(50.0), "about 1 min");
+        assert_eq!(human_duration(200.0), "about 4 min");
+        assert_eq!(human_duration(5400.0), "about 1 h 30 min");
+    }
 
     /// End-to-end against the real API. Run with:
     /// OPENROUTER_API_KEY=… TEST_AUDIO=/path/file cargo test --release -- --ignored --nocapture
