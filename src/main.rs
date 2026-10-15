@@ -2,6 +2,7 @@
 
 mod audio;
 mod config;
+mod icons;
 mod install;
 mod jobs;
 mod local;
@@ -12,7 +13,7 @@ mod theme;
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
 
-use eframe::egui::{self, Align, Layout, PopupCloseBehavior, RichText, Sense, Shape, Stroke, UiBuilder};
+use eframe::egui::{self, Align, Color32, Layout, PopupCloseBehavior, RichText, Sense, Shape, Stroke, UiBuilder};
 
 use config::Settings;
 use jobs::{Event, Job};
@@ -151,7 +152,7 @@ fn scale(ui: &mut egui::Ui, symbol: &str, n: u8, note: &str) {
     let p = theme::palette(ui.ctx());
     let mut job = egui::text::LayoutJob::default();
     for i in 0..3 {
-        let color = if i < n { p.text } else { p.border };
+        let color = if i < n { p.text } else { p.text.gamma_multiply(0.22) };
         job.append(symbol, 0.0, egui::TextFormat { font_id: egui::FontId::proportional(12.5), color, ..Default::default() });
     }
     ui.add(egui::Label::new(job).sense(Sense::hover())).on_hover_text(note);
@@ -163,7 +164,7 @@ fn brains(ui: &mut egui::Ui, n: u8, note: &str) {
     let (rect, resp) = ui.allocate_exact_size(egui::vec2(3.0 * 16.0, 16.0), Sense::hover());
     for i in 0..3 {
         let c = rect.left_center() + egui::vec2(8.0 + i as f32 * 16.0, -0.5);
-        let color = if i < n { p.text } else { p.border };
+        let color = if i < n { p.text } else { p.text.gamma_multiply(0.22) };
         let painter = ui.painter();
         for (dx, dy, r) in [(-3.1, -2.4, 3.1), (3.1, -2.4, 3.1), (-3.3, 2.0, 3.0), (3.3, 2.0, 3.0), (0.0, 0.0, 3.6)] {
             painter.circle_filled(c + egui::vec2(dx, dy), r, color);
@@ -195,32 +196,81 @@ fn group_label(ui: &mut egui::Ui, text: &str) {
     ui.label(muted(ui, text).family(theme::semibold()).size(12.0));
 }
 
-fn stt_row(ui: &mut egui::Ui, m: &SttModel, selected: &mut std::collections::BTreeSet<String>, dirty: &mut bool) {
-    let mut on = selected.contains(&m.id);
-    ui.horizontal(|ui| {
-        if ui.checkbox(&mut on, &m.name).changed() {
-            if on {
-                selected.insert(m.id.clone());
-            } else {
-                selected.remove(&m.id);
-            }
-            *dirty = true;
-        }
-        ui.label(muted(ui, &m.provider).size(12.5));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| rating_ui(ui, &m.rating));
-    });
+/// A selectable surface. The chosen one is tinted and outlined in the accent colour; there is no check mark.
+fn choice(ui: &mut egui::Ui, size: egui::Vec2, selected: bool, bordered: bool, margin: egui::Vec2, content: impl FnOnce(&mut egui::Ui)) -> egui::Response {
+    let p = theme::palette(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let (fill, stroke) = if selected {
+        (p.surface.lerp_to_gamma(p.accent, 0.18), Stroke::new(1.0, p.accent))
+    } else if resp.hovered() {
+        (p.bg, Stroke::new(1.0, if bordered { p.muted } else { p.border }))
+    } else if bordered {
+        (p.surface, Stroke::new(1.0, p.border))
+    } else {
+        (Color32::TRANSPARENT, Stroke::NONE)
+    };
+    ui.painter().rect(rect, 3.0, fill, stroke, egui::StrokeKind::Inside);
+    // A child that does not claim extra room in the parent, so the card keeps exactly the size it was given.
+    let mut inner = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(margin)).layout(Layout::top_down(Align::Min)));
+    content(&mut inner);
+    resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
 
-fn llm_row(ui: &mut egui::Ui, m: &LlmModel, current: &mut String, dirty: &mut bool) {
-    ui.horizontal(|ui| {
-        if ui.selectable_label(*current == m.id, &m.name).clicked() {
-            *current = m.id.clone();
-            *dirty = true;
-            ui.close();
-        }
-        ui.label(muted(ui, &m.provider).size(12.5));
-        ui.with_layout(Layout::right_to_left(Align::Center), |ui| rating_ui(ui, &m.rating));
-    });
+/// Recommended model as a card. Returns true when clicked.
+fn model_card(ui: &mut egui::Ui, width: f32, id: &str, name: &str, provider: &str, rating: &Rating, selected: bool) -> bool {
+    let p = theme::palette(ui.ctx());
+    choice(ui, egui::vec2(width, 82.0), selected, true, egui::vec2(11.0, 10.0), |ui| {
+        ui.spacing_mut().item_spacing.y = 5.0;
+        ui.spacing_mut().interact_size.y = 18.0;
+        ui.horizontal(|ui| {
+            icons::show(ui, id, 18.0, p.text);
+            ui.add(egui::Label::new(semibold(name)).truncate());
+        });
+        ui.label(muted(ui, provider).size(12.5));
+        ui.horizontal(|ui| rating_ui(ui, rating));
+    })
+    .clicked()
+}
+
+/// Any other model as a compact row. `right` fills the right-hand end. Returns true when clicked.
+fn model_row(ui: &mut egui::Ui, id: &str, name: &str, provider: &str, selected: bool, right: impl FnOnce(&mut egui::Ui)) -> bool {
+    let p = theme::palette(ui.ctx());
+    choice(ui, egui::vec2(ui.available_width(), 30.0), selected, false, egui::vec2(8.0, 3.0), |ui| {
+        egui::Sides::new().shrink_left().truncate().show(
+            ui,
+            |ui| {
+                icons::show(ui, id, 16.0, p.text);
+                ui.label(name);
+                if !provider.is_empty() {
+                    ui.label(muted(ui, provider).size(12.5));
+                }
+            },
+            right,
+        );
+    })
+    .clicked()
+}
+
+/// Lays cards out two to a row.
+fn card_grid<T>(ui: &mut egui::Ui, items: &[&T], mut card: impl FnMut(&mut egui::Ui, &T, f32)) {
+    let gap = 6.0;
+    let width = ((ui.available_width() - gap) / 2.0).floor();
+    for pair in items.chunks(2) {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            for item in pair {
+                card(ui, item, width);
+            }
+        });
+        ui.add_space(4.0);
+    }
+}
+
+fn toggle(set: &mut std::collections::BTreeSet<String>, id: &str, dirty: &mut bool) {
+    if !set.remove(id) {
+        set.insert(id.to_string());
+    }
+    *dirty = true;
 }
 
 // ---------- app ----------
@@ -545,15 +595,20 @@ impl App {
         if let Some(file) = self.file.clone() {
             surface_panel(ui).show(ui, |ui| {
                 ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(semibold(file.file_name().unwrap_or_default().to_string_lossy()));
-                    ui.label(muted(ui, human_size(self.file_size)));
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                let name = file.file_name().unwrap_or_default().to_string_lossy().to_string();
+                // A long name is cut short so the size and "Change" always keep their place.
+                egui::Sides::new().shrink_left().truncate().show(
+                    ui,
+                    |ui| {
+                        ui.label(semibold(name.clone())).on_hover_text(name);
+                    },
+                    |ui| {
                         if link(ui, "Change") {
                             self.pick_file();
                         }
-                    });
-                });
+                        ui.label(muted(ui, human_size(self.file_size)));
+                    },
+                );
             });
             return;
         }
@@ -628,16 +683,19 @@ impl App {
                     let picks: Vec<&SttModel> = rating::RECOMMENDED_STT.iter().filter_map(|id| cat.stt.iter().find(|m| m.id == *id)).filter(shown).collect();
                     if !picks.is_empty() {
                         group_label(ui, "Selection");
-                        for m in &picks {
-                            stt_row(ui, m, &mut self.settings.remote_models, &mut self.dirty);
-                        }
-                        ui.add_space(4.0);
+                        card_grid(ui, &picks, |ui, m, w| {
+                            if model_card(ui, w, &m.id, &m.name, &m.provider, &m.rating, self.settings.remote_models.contains(&m.id)) {
+                                toggle(&mut self.settings.remote_models, &m.id, &mut self.dirty);
+                            }
+                        });
                     }
                     let rest: Vec<&SttModel> = cat.stt.iter().filter(|m| !rating::RECOMMENDED_STT.contains(&m.id.as_str())).filter(shown).collect();
                     if !rest.is_empty() {
                         group_label(ui, "All models");
                         for m in rest {
-                            stt_row(ui, m, &mut self.settings.remote_models, &mut self.dirty);
+                            if model_row(ui, &m.id, &m.name, &m.provider, self.settings.remote_models.contains(&m.id), |ui| rating_ui(ui, &m.rating)) {
+                                toggle(&mut self.settings.remote_models, &m.id, &mut self.dirty);
+                            }
                         }
                     }
                 }
@@ -661,19 +719,13 @@ impl App {
                 if !q.is_empty() && !title.to_lowercase().contains(&q) {
                     continue;
                 }
-                let mut on = self.settings.local_models.contains(*name);
-                ui.horizontal(|ui| {
-                    if ui.checkbox(&mut on, *title).changed() {
-                        if on {
-                            self.settings.local_models.insert(name.to_string());
-                        } else {
-                            self.settings.local_models.remove(*name);
-                        }
-                        self.dirty = true;
-                    }
-                    let note = if local::is_downloaded(name) { format!("{detail} · downloaded") } else { detail.to_string() };
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| ui.label(muted(ui, note).size(12.5)));
-                });
+                let note = if local::is_downloaded(name) { format!("{detail} · downloaded") } else { detail.to_string() };
+                // Whisper is OpenAI's, so it wears their mark.
+                if model_row(ui, "openai/whisper", title, "", self.settings.local_models.contains(*name), |ui| {
+                    ui.label(muted(ui, note).size(12.5));
+                }) {
+                    toggle(&mut self.settings.local_models, name, &mut self.dirty);
+                }
             }
         });
     }
@@ -865,16 +917,23 @@ impl App {
             let picks: Vec<&LlmModel> = rating::RECOMMENDED_LLM.iter().filter_map(|id| cat.llm.iter().find(|m| m.id == *id)).filter(shown).collect();
             if !picks.is_empty() {
                 group_label(ui, "Selection");
-                for m in &picks {
-                    llm_row(ui, m, &mut self.settings.llm, &mut self.dirty);
-                }
-                ui.add_space(4.0);
+                card_grid(ui, &picks, |ui, m, w| {
+                    if model_card(ui, w, &m.id, &m.name, &m.provider, &m.rating, self.settings.llm == m.id) {
+                        self.settings.llm = m.id.clone();
+                        self.dirty = true;
+                        ui.close();
+                    }
+                });
             }
             let rest: Vec<&LlmModel> = cat.llm.iter().filter(|m| !rating::RECOMMENDED_LLM.contains(&m.id.as_str())).filter(shown).collect();
             if !rest.is_empty() {
                 group_label(ui, "All models");
                 for m in rest {
-                    llm_row(ui, m, &mut self.settings.llm, &mut self.dirty);
+                    if model_row(ui, &m.id, &m.name, &m.provider, self.settings.llm == m.id, |ui| rating_ui(ui, &m.rating)) {
+                        self.settings.llm = m.id.clone();
+                        self.dirty = true;
+                        ui.close();
+                    }
                 }
             }
         });

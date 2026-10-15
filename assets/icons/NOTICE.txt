@@ -1,0 +1,2 @@
+Company marks in this folder are white-on-transparent renderings of the SVGs from @lobehub/icons-static-svg 1.95.1 (MIT, https://github.com/lobehub/lobe-icons).
+The marks themselves are trademarks of their owners (Anthropic, OpenAI, Google, Microsoft, Meta, Mistral AI, xAI, NVIDIA, DeepSeek, Alibaba/Qwen, ElevenLabs) and are used only to identify those companies' models.

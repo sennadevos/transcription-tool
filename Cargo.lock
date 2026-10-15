@@ -3812,6 +3812,7 @@ dependencies = [
  "eframe",
  "hound",
  "mslnk",
+ "png",
  "rfd",
  "serde",
  "serde_json",
