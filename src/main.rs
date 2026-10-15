@@ -212,6 +212,8 @@ fn choice(ui: &mut egui::Ui, size: egui::Vec2, selected: bool, bordered: bool, m
     ui.painter().rect(rect, 3.0, fill, stroke, egui::StrokeKind::Inside);
     // A child that does not claim extra room in the parent, so the card keeps exactly the size it was given.
     let mut inner = ui.new_child(UiBuilder::new().max_rect(rect.shrink2(margin)).layout(Layout::top_down(Align::Min)));
+    // Selectable text would swallow the clicks meant for the card.
+    inner.style_mut().interaction.selectable_labels = false;
     content(&mut inner);
     resp.on_hover_cursor(egui::CursorIcon::PointingHand)
 }
