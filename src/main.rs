@@ -536,19 +536,29 @@ impl App {
         ids
     }
 
-    /// Warns before starting when a local model is known to be slow on this computer for this file.
+    /// Warns before starting when a local model is expected to be slow on this computer for this file.
+    /// Uses the speed measured on an earlier run, or a rough guess when the model has not run here yet.
     fn slow_local_note(&self) -> Option<String> {
         let secs = self.file_secs?;
-        let local: Vec<&String> = self.settings.local_models.iter().collect();
         // Several local models share the same processor, so each takes about that many times longer.
-        let share = local.len() as f64;
-        let (name, est) = local
+        let share = self.settings.local_models.len() as f64;
+        let (name, est, measured) = self
+            .settings
+            .local_models
             .iter()
-            .filter_map(|m| Some((m, secs / *self.settings.local_speed.get(*m)? * share)))
+            .map(|m| match self.settings.local_speed.get(m) {
+                Some(speed) => (m, secs / speed * share, true),
+                None => (m, secs / local::guessed_speed(m) * share, false),
+            })
             .max_by(|a, b| a.1.total_cmp(&b.1))?;
         (est > SLOW_LOCAL_SECS).then(|| {
             let title = local::MODELS.iter().find(|m| m.0 == name.as_str()).map_or(name.as_str(), |m| m.1);
-            format!("{title} will take {} on this computer. Online models are usually much quicker.", jobs::human_duration(est))
+            let time = jobs::human_duration(est);
+            if measured {
+                format!("{title} will take {time} on this computer. Online models are usually much quicker.")
+            } else {
+                format!("{title} will probably take {time} on this computer, and the computer will be busy meanwhile. This is a rough guess. Online models are usually much quicker.")
+            }
         })
     }
 
@@ -750,8 +760,13 @@ impl App {
             });
         });
         if let Some(note) = self.slow_local_note() {
-            ui.add_space(6.0);
-            ui.label(note);
+            ui.add_space(8.0);
+            let p = theme::palette(ui.ctx());
+            egui::Frame::NONE.fill(p.surface).stroke(Stroke::new(1.0, p.accent)).corner_radius(8.0).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(semibold("This may take a while"));
+                ui.label(note);
+            });
         }
         ui.add_space(6.0);
         self.dirty |= ui.checkbox(&mut self.settings.merge, "Combine into one final transcript").changed();

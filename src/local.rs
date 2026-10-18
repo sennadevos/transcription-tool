@@ -20,6 +20,21 @@ pub const MODELS: &[(&str, &str, &str)] = &[
     ("large-v3", "Whisper large v3", "3.1 GB, slowest, most accurate"),
 ];
 
+/// Rough speed of a model on a typical eight-core computer, in seconds of audio per second of waiting. A guess for models
+/// that have not run here yet; the first real run replaces it with a measurement. Deliberately on the slow side.
+pub fn guessed_speed(name: &str) -> f64 {
+    let base = match name {
+        "tiny" => 8.0,
+        "base" => 5.0,
+        "small" => 2.0,
+        "medium" => 0.6,
+        "large-v3" => 0.3,
+        _ => 0.8, // the large v3 turbo variants
+    };
+    let cores = std::thread::available_parallelism().map_or(4, |n| n.get()) as f64;
+    base * (cores / 8.0).clamp(0.25, 1.5)
+}
+
 pub fn model_path(name: &str) -> PathBuf {
     models_dir().join(format!("ggml-{name}.bin"))
 }
@@ -128,7 +143,7 @@ mod tests {
     fn local_progress() {
         let samples = crate::audio::decode(std::path::Path::new(&std::env::var("TEST_AUDIO").expect("TEST_AUDIO"))).unwrap();
         let etas = std::sync::Mutex::new(Vec::new());
-        let out = super::transcribe("tiny", &samples, "", &|m| println!("{m}"), &|r| etas.lock().unwrap().push(r), &Default::default()).unwrap();
+        let out = super::transcribe(&std::env::var("TT_MODEL").unwrap_or("tiny".into()), &samples, "", &|m| println!("{m}"), &|r| etas.lock().unwrap().push(r), &Default::default()).unwrap();
         let etas = etas.into_inner().unwrap();
         println!("audio {:.0}s, speed {:.1}x, {} estimates, first {:?}, last {:?}", samples.len() as f64 / 16000.0, out.speed, etas.len(), etas.first(), etas.last());
         assert!(out.speed > 0.0 && !out.text.is_empty());
