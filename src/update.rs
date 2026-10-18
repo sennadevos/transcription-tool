@@ -77,8 +77,8 @@ pub fn cleanup() {
     }
 }
 
-/// Downloads and checks the new version, puts it in place of this program and starts it. The caller must then exit.
-pub fn apply(rel: &Release) -> Result<()> {
+/// Downloads the new version and checks it against the checksum GitHub published for it.
+fn download(rel: &Release) -> Result<Vec<u8>> {
     let mut resp = agent().get(&rel.url).header("User-Agent", format!("transcription-tool/{VERSION}")).call().map_err(net_error)?;
     if resp.status().as_u16() != 200 {
         return Err(anyhow!("The update could not be downloaded (error {}). Try again later.", resp.status().as_u16()));
@@ -89,18 +89,28 @@ pub fn apply(rel: &Release) -> Result<()> {
     if got != rel.sha256 {
         return Err(anyhow!("The downloaded update is damaged, so it was not installed. Try again."));
     }
+    Ok(bytes)
+}
 
-    let exe = std::env::current_exe()?;
-    let new = sibling(&exe, ".new");
-    let old = sibling(&exe, ".old");
+/// Puts `bytes` in place of the program at `exe`, even while it is running.
+fn replace(exe: &std::path::Path, bytes: &[u8]) -> Result<()> {
+    let new = sibling(exe, ".new");
+    let old = sibling(exe, ".old");
     let cant = |_| anyhow!("Can't update the program in its current place. Download the new version from github.com/{REPO}/releases instead.");
-    std::fs::write(&new, &bytes).map_err(cant)?;
+    std::fs::write(&new, bytes).map_err(cant)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&new, std::fs::Permissions::from_mode(0o755)).map_err(cant)?;
     }
-    swap(&exe, &new, &old).map_err(cant)?;
+    swap(exe, &new, &old).map_err(cant)
+}
+
+/// Downloads and checks the new version, puts it in place of this program and starts it. The caller must then exit.
+pub fn apply(rel: &Release) -> Result<()> {
+    let bytes = download(rel)?;
+    let exe = std::env::current_exe()?;
+    replace(&exe, &bytes)?;
     std::process::Command::new(&exe).spawn().context("The update was installed, but the program could not restart. Open it again yourself.")?;
     Ok(())
 }
@@ -131,6 +141,28 @@ mod tests {
         assert!(is_newer("1.0", "0.9.9"));
         assert!(!is_newer("v0.1.0", "0.1.0"));
         assert!(!is_newer("0.1.0", "0.2.0"));
+    }
+
+    /// Needs internet and a published release newer than 0.0.1: cargo test --release -- --ignored update_from_real_release
+    #[test]
+    #[ignore]
+    fn update_from_real_release() {
+        let mut resp = agent().get(format!("https://api.github.com/repos/{REPO}/releases/latest")).header("User-Agent", "test").call().unwrap();
+        let body: Value = resp.body_mut().read_json().unwrap();
+        let rel = release_from(&body, "0.0.1").unwrap().expect("a release newer than 0.0.1");
+        let bytes = download(&rel).unwrap();
+        assert!(bytes.len() > 1_000_000);
+        let dir = std::env::temp_dir().join(format!("tt-update-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("transcription-tool");
+        std::fs::write(&exe, b"old version").unwrap();
+        replace(&exe, &bytes).unwrap();
+        assert_eq!(std::fs::read(&exe).unwrap(), bytes);
+        assert!(!sibling(&exe, ".new").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        // A tampered checksum must be refused.
+        let bad = Release { sha256: "0".repeat(64), ..rel };
+        assert!(download(&bad).unwrap_err().to_string().contains("damaged"));
     }
 
     #[test]
