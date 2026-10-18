@@ -105,6 +105,10 @@ struct App {
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     key_notice: Option<String>,
     key_notice_rx: Option<Receiver<Result<(), String>>>,
+    /// Individual results are open, so a failure is not hidden.
+    details_open: bool,
+    /// The chosen file could not be decoded; set while a job runs.
+    file_unreadable: bool,
     update: UpdateState,
     update_rx: Option<Receiver<UpdateMsg>>,
 }
@@ -329,6 +333,8 @@ impl App {
             cancel: None,
             key_notice: None,
             key_notice_rx: None,
+            details_open: false,
+            file_unreadable: false,
             update: UpdateState::None,
             update_rx: None,
         };
@@ -503,10 +509,16 @@ impl App {
                         Err(e) => CardState::Err(e),
                     })
                 }
+                Event::UnreadableFile => self.file_unreadable = true,
                 Event::Done => done = true,
             }
         }
         if done {
+            // Nothing succeeded, so there was nothing to combine.
+            if matches!(self.merged, Some(CardState::Running(_))) {
+                self.merged = None;
+            }
+            self.details_open = self.cards.iter().any(|c| matches!(c.state, CardState::Err(_))) || matches!(self.merged, Some(CardState::Err(_)));
             self.rx = None;
             self.cancel = None;
             self.status.clear();
@@ -574,6 +586,8 @@ impl App {
     fn start(&mut self, ctx: &egui::Context) {
         let Some(file) = self.file.clone() else { return };
         let models: Vec<(String, String)> = self.selected_ids().into_iter().map(|id| (self.model_name(&id), id)).map(|(n, i)| (i, n)).collect();
+        self.details_open = false;
+        self.file_unreadable = false;
         self.cards = models.iter().map(|(id, label)| Card { id: id.clone(), label: label.clone(), state: CardState::Running("Waiting…".into()), started: std::time::Instant::now() }).collect();
         self.merged = self.settings.merge.then(|| CardState::Running("Waiting for the transcripts…".into()));
         let job = Job {
@@ -849,6 +863,9 @@ impl App {
     fn ui_results(&mut self, ui: &mut egui::Ui) {
         let mut fix_key = false;
         let file = self.file.clone();
+        if !self.running() {
+            self.ui_failure_summary(ui);
+        }
         if let Some(state) = &self.merged {
             fix_key |= Self::ui_result(ui, "Final transcript", None, state, file.as_ref(), None, &mut false);
             ui.add_space(14.0);
@@ -865,11 +882,13 @@ impl App {
             }
         };
         if self.merged.is_some() {
-            let failed = matches!(self.merged, Some(CardState::Err(_)));
-            egui::CollapsingHeader::new(semibold(format!("Individual results ({})", self.cards.len())))
+            let shown = egui::CollapsingHeader::new(semibold(format!("Individual results ({})", self.cards.len())))
                 .id_salt("individual")
-                .default_open(failed)
+                .open(Some(self.details_open))
                 .show(ui, |ui| draw(ui, &mut fix_key, &mut stop));
+            if shown.header_response.clicked() {
+                self.details_open = !self.details_open;
+            }
         } else {
             draw(ui, &mut fix_key, &mut stop);
         }
@@ -881,6 +900,44 @@ impl App {
         if fix_key {
             self.open_key_settings();
         }
+    }
+
+    /// One plain sentence above the results when some or all models did not deliver, so nobody has to open each result to find out.
+    fn ui_failure_summary(&mut self, ui: &mut egui::Ui) {
+        let failed: Vec<&Card> = self.cards.iter().filter(|c| matches!(c.state, CardState::Err(_))).collect();
+        if failed.is_empty() {
+            return;
+        }
+        let first_line = |c: &Card| match &c.state {
+            CardState::Err(e) => e.lines().next().unwrap_or_default().to_string(),
+            _ => String::new(),
+        };
+        let reason = first_line(failed[0]);
+        let same = failed.iter().all(|c| first_line(c) == reason);
+        let (title, body) = if failed.len() == self.cards.len() {
+            let body = if self.file_unreadable && !same {
+                "This file can't be read as audio. It may be damaged, or not an audio file. Try an mp3, wav or m4a file.".to_string()
+            } else if same {
+                reason.clone()
+            } else {
+                "The reasons are listed below.".to_string()
+            };
+            (if self.cards.len() == 1 { "This didn't work".to_string() } else { "None of the models could transcribe this".to_string() }, body)
+        } else {
+            let names: Vec<&str> = failed.iter().map(|c| c.label.as_str()).collect();
+            let combined = if matches!(self.merged, Some(CardState::Ok(_))) { " The final transcript uses the others." } else { "" };
+            (format!("{} of {} models didn't finish", failed.len(), self.cards.len()), format!("{}.{combined}", names.join(", ")))
+        };
+        let p = theme::palette(ui.ctx());
+        egui::Frame::NONE.fill(p.surface).stroke(Stroke::new(1.0, p.error)).corner_radius(8.0).inner_margin(egui::Margin::symmetric(12, 10)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(semibold(title));
+            ui.label(body);
+            if self.merged.is_some() && !self.details_open && link(ui, "Show details") {
+                self.details_open = true;
+            }
+        });
+        ui.add_space(14.0);
     }
 
     /// Returns true if the user asked to fix their key.
@@ -934,7 +991,11 @@ impl App {
                 });
             }
             CardState::Err(e) => {
-                ui.label(RichText::new(e).color(p.error));
+                let (plain, detail) = e.split_once('\n').unwrap_or((e, ""));
+                ui.label(RichText::new(plain).color(p.error));
+                if !detail.is_empty() {
+                    ui.label(muted(ui, detail).size(12.0));
+                }
                 if openrouter::is_key_problem(e) && link(ui, "Update your key") {
                     fix = true;
                 }

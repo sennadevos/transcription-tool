@@ -12,6 +12,8 @@ pub enum Event {
     LocalSpeed { model: String, speed: f64 },
     Finished { id: String, result: Result<String, String> },
     Merged(Result<String, String>),
+    /// The file could not be read as audio on this computer.
+    UnreadableFile,
     Done,
 }
 
@@ -58,6 +60,9 @@ pub fn run(job: Job, tx: Sender<Event>, ctx: eframe::egui::Context) {
 
     send(Event::Status("Reading audio…".into()));
     let decoded = audio::decode(&job.file);
+    if decoded.is_err() {
+        send(Event::UnreadableFile);
+    }
     let has_remote = job.models.iter().any(|(id, _)| !id.starts_with("local/"));
 
     // Remote payload: decoded WAV chunks, or the original file if we could not decode it.

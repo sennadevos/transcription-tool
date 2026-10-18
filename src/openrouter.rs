@@ -78,10 +78,20 @@ fn status_message(status: u16, body: &Value) -> String {
         413 => "This recording is too large for this model. Try another model.".into(),
         429 => "OpenRouter is busy right now. Wait a minute and try again.".into(),
         500..=599 => format!("OpenRouter, or the company behind this model, has a temporary problem (error {status}). Try again in a few minutes, or pick another model."),
-        _ => match body["error"]["message"].as_str().map(str::trim).filter(|m| !m.is_empty()) {
-            Some(m) => format!("OpenRouter refused the request: {}", m.chars().take(200).collect::<String>()),
-            None => format!("OpenRouter refused the request (error {status})."),
-        },
+        _ => {
+            // The plain sentence comes first; what the provider said follows on a second line for whoever has to dig deeper.
+            let plain = match status {
+                400 | 415 | 422 => "This model couldn't process this recording. Try another model, or another file format such as mp3 or wav.",
+                403 => "This model isn't available to you right now. Try another model.",
+                404 => "This model isn't available right now. Pick another one.",
+                _ => "Something went wrong with this request. Try again, or pick another model.",
+            };
+            let detail = match body["error"]["message"].as_str().map(str::trim).filter(|m| !m.is_empty()) {
+                Some(m) => m.chars().take(200).collect::<String>().replace('\n', " "),
+                None => format!("Error code {status}"),
+            };
+            format!("{plain}\n{detail}")
+        }
     }
 }
 
@@ -232,6 +242,7 @@ mod tests {
         assert!(status_message(502, &none).contains("temporary problem"));
         assert!(status_message(400, &json!({"error": {"message": "Bad audio"}})).ends_with("Bad audio"));
         assert!(status_message(418, &none).contains("418"));
+        assert!(status_message(400, &none).starts_with("This model couldn't process this recording."));
     }
 
     /// Hits the public model list. Run with: cargo test --release -- --ignored --nocapture
