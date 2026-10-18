@@ -9,6 +9,7 @@ mod local;
 mod openrouter;
 mod rating;
 mod theme;
+mod update;
 
 use std::path::PathBuf;
 use std::sync::mpsc::{Receiver, channel};
@@ -45,6 +46,7 @@ const COLUMN_WIDTH: f32 = 680.0;
 const SLOW_LOCAL_SECS: f64 = 180.0;
 
 fn main() -> eframe::Result {
+    update::cleanup();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Transcription Tool")
@@ -103,6 +105,20 @@ struct App {
     cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     key_notice: Option<String>,
     key_notice_rx: Option<Receiver<Result<(), String>>>,
+    update: UpdateState,
+    update_rx: Option<Receiver<UpdateMsg>>,
+}
+
+enum UpdateState {
+    None,
+    Available(update::Release),
+    Installing(String),
+    Failed(update::Release, String),
+}
+
+enum UpdateMsg {
+    Found(Option<update::Release>),
+    Failed(update::Release, String),
 }
 
 // ---------- small widgets ----------
@@ -313,13 +329,45 @@ impl App {
             cancel: None,
             key_notice: None,
             key_notice_rx: None,
+            update: UpdateState::None,
+            update_rx: None,
         };
         if let Some(p) = std::env::args_os().nth(1).map(PathBuf::from).filter(|p| p.is_file()) {
             app.set_file(p);
         }
         app.load_catalog(ctx);
         app.recheck_saved_key(ctx);
+        app.check_for_update(ctx);
         app
+    }
+
+    /// Looks for a newer release in the background; staying quiet when offline or when there is none.
+    fn check_for_update(&mut self, ctx: &egui::Context) {
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            if let Ok(found) = update::check() {
+                let _ = tx.send(UpdateMsg::Found(found));
+                ctx.request_repaint();
+            }
+        });
+        self.update_rx = Some(rx);
+    }
+
+    fn install_update(&mut self, ctx: &egui::Context, rel: update::Release) {
+        self.update = UpdateState::Installing(rel.version.clone());
+        let (tx, rx) = channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            match update::apply(&rel) {
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    let _ = tx.send(UpdateMsg::Failed(rel, format!("{e:#}")));
+                }
+            }
+            ctx.request_repaint();
+        });
+        self.update_rx = Some(rx);
     }
 
     /// Asks OpenRouter (free of charge) whether the saved key still works, so an expired key shows up before the first transcription.
@@ -390,6 +438,16 @@ impl App {
                     Err(e) => self.catalog_error = Some(e),
                 }
                 self.catalog_rx = None;
+            }
+        }
+        if let Some(rx) = &self.update_rx {
+            if let Ok(msg) = rx.try_recv() {
+                self.update_rx = None;
+                self.update = match msg {
+                    UpdateMsg::Found(Some(rel)) => UpdateState::Available(rel),
+                    UpdateMsg::Found(None) => UpdateState::None,
+                    UpdateMsg::Failed(rel, e) => UpdateState::Failed(rel, e),
+                };
             }
         }
         if let Some(rx) = &self.key_notice_rx {
@@ -597,6 +655,8 @@ impl App {
             }
             ui.add_space(8.0);
         }
+
+        self.ui_update_notice(ui);
 
         self.ui_file(ui);
         ui.add_space(16.0);
@@ -936,6 +996,7 @@ impl App {
         }
 
         section_title(ui, "This computer");
+        ui.label(muted(ui, format!("Version {}", update::VERSION)));
         if install::is_installed_copy() {
             if link(ui, "Uninstall Transcription Tool…") {
                 let yes = rfd::MessageDialog::new()
@@ -999,6 +1060,37 @@ impl App {
                 }
             }
         });
+    }
+
+    fn ui_update_notice(&mut self, ui: &mut egui::Ui) {
+        let p = theme::palette(ui.ctx());
+        let mut start = None;
+        match &self.update {
+            UpdateState::None => return,
+            UpdateState::Available(rel) | UpdateState::Failed(rel, _) => {
+                if let UpdateState::Failed(_, e) = &self.update {
+                    ui.label(RichText::new(e).color(p.error));
+                }
+                ui.horizontal(|ui| {
+                    ui.label(format!("Version {} is available.", rel.version));
+                    if self.running() {
+                        ui.label(muted(ui, "You can update when the transcription is done."));
+                    } else if link(ui, "Update now") {
+                        start = Some(rel.clone());
+                    }
+                });
+            }
+            UpdateState::Installing(v) => {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label(muted(ui, format!("Downloading version {v}… the program restarts by itself")));
+                });
+            }
+        }
+        ui.add_space(8.0);
+        if let Some(rel) = start {
+            self.install_update(ui.ctx(), rel);
+        }
     }
 
     fn run_install(&mut self) {
